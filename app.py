@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 import google.generativeai as genai
 import edge_tts
-
+import Bridge_sADIQ as sadiq
 # 1. إنشاء تطبيق FastAPI
 app = FastAPI(title="Bridge-AI Backend")
 
