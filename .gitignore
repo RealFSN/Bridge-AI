@@ -2,4 +2,4 @@ venv/
 __pycache__/
 *.dylib
 *.so
-.DS_Store
+.DS_Storegit add .
