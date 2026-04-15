@@ -2,94 +2,92 @@ import os
 import whisper
 import torch
 import asyncio
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 import google.generativeai as genai
 import edge_tts
-import Bridge_sADIQ as sadiq
+from typing import Optional
+
 # 1. إنشاء تطبيق FastAPI
 app = FastAPI(title="Bridge-AI Backend")
 
-# 2. إعدادات الـ CORS (ضرورية جداً لربط تطبيق فلاتر مستقبلاً)
+# 2. إعدادات الـ CORS لضمان اتصال فلاتر بدون مشاكل
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # يسمح بالاتصال من أي جهاز أو تطبيق
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 3. تحميل الموديلات مرة واحدة عند تشغيل السيرفر (لضمان السرعة والاستقرار)
-print("--- جاري تحميل موديل Whisper ---")
+# 3. تحميل موديل Whisper (مرة واحدة عند التشغيل)
 device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"--- Loading Whisper model on: {device} ---")
 whisper_model = whisper.load_model("base", device=device)
-print(f"--- تم التحميل على: {device} ---")
 
-# 4. إعداد Gemini (تأكد من وضع مفتاحك هنا)
+# 4. إعداد Gemini
 GEMINI_API_KEY = "AIzaSyCEha0n0YrS-1nFwOLRptOqW0_ixBkRJqw"
 genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel('gemini-pro')
+gemini_model = genai.GenerativeModel('gemini-2.5-flash')
 
 @app.get("/")
 async def health_check():
-    return {"status": "online", "project": "Bridge-AI"}
+    return {"status": "online", "message": "Backend is running"}
 
-@app.post("/process-bridge")
-async def process_audio(audio_file: UploadFile = File(...)):
+# 5. الدالة الأساسية (تم تعديلها لتستقبل نص أو ملف)
+@app.post("/process-audio")
+async def process_data(
+    file: Optional[UploadFile] = File(None), 
+    text: Optional[str] = Form(None),
+    language: str = Form("en")
+):
     """
-    هذه الدالة تستقبل ملف صوتي، تحوله لنص، تترجمه بـ Gemini، ثم تصنع منه صوت مترجم.
+    تستقبل هذه الدالة:
+    - ملف صوتي (من التسجيل أو الرفع)
+    - أو نص مباشر (من حقل الكتابة في فلاتر)
     """
-    input_path = f"temp_in_{audio_file.filename}"
-    output_audio_path = "output_translated.mp3"
-
     try:
-        # أ- حفظ الملف الصوتي المرفوع من المستخدم
-        with open(input_path, "wb") as f:
-            f.write(await audio_file.read())
+        input_text = ""
 
-        # ب- تحويل الصوت لنص (Speech-to-Text)
-        print("جاري تحويل الصوت لنص...")
-        result = whisper_model.transcribe(input_path)
-        original_text = result['text']
+        # الحالة الأولى: إذا أرسل المستخدم ملف صوتي
+        if file:
+            temp_path = f"temp_{file.filename}"
+            with open(temp_path, "wb") as f:
+                f.write(await file.read())
+            
+            print(f"Processing audio file: {temp_path}")
+            result = whisper_model.transcribe(temp_path)
+            input_text = result['text']
+            os.remove(temp_path) # حذف الملف المؤقت فوراً
+        
+        # الحالة الثانية: إذا أرسل المستخدم نصاً
+        elif text:
+            print(f"Processing text input: {text}")
+            input_text = text
+        
+        else:
+            raise HTTPException(status_code=400, detail="No input provided")
 
-        # ج- المعالجة والترجمة عبر Gemini (نفس منطق مشروعك)
-        print("جاري الترجمة عبر Gemini...")
-        prompt = f"Translate the following text to Arabic (or English if it's already Arabic): {original_text}"
+        # معالجة النص عبر Gemini (تحويل النص لوصف لغة إشارة)
+        # يمكنك تعديل الـ Prompt هنا ليناسب مخرجاتك
+        prompt = f"Convert the following sentence into sign language gloss or keywords for animation: {input_text}"
         response = gemini_model.generate_content(prompt)
-        translated_text = response.text
+        ai_result = response.text
 
-        # د- تحويل النص المترجم لصوت (Text-to-Speech)
-        print("جاري توليد الصوت المترجم...")
-        # ملاحظة: ar-SA-ZariyahNeural هو صوت أنثوي سعودي، يمكنك تغييره
-        communicate = edge_tts.Communicate(translated_text, "ar-SA-ZariyahNeural")
-        await communicate.save(output_audio_path)
-
-        # هـ- إرسال النتائج النهائية
+        # إرسال الرد لفلاتر (حالياً رابط فيديو ثابت كما في طلبك)
         return {
             "status": "success",
-            "original_text": original_text,
-            "translated_text": translated_text,
-            "audio_download_url": "/download-result"
+            "original_text": input_text,
+            "ai_description": ai_result,
+            "video_url": "https://flutter.github.io/assets-for-api-docs/assets/videos/bee.mp4" 
         }
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error occurred: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-    
-    finally:
-        # تنظيف الملفات المؤقتة المدخلة فقط
-        if os.path.exists(input_path):
-            os.remove(input_path)
-
-@app.get("/download-result")
-async def download_result():
-    """دالة للسماح للتطبيق بتحميل ملف الصوت الناتج"""
-    if os.path.exists("output_translated.mp3"):
-        return FileResponse("output_translated.mp3", media_type="audio/mpeg")
-    return {"error": "File not found"}
 
 if __name__ == "__main__":
     import uvicorn
-    # تشغيل السيرفر محلياً على بورت 8000
+    # تشغيل السيرفر على 0.0.0.0 ليتمكن الجوال من الوصول إليه عبر الشبكة
     uvicorn.run(app, host="0.0.0.0", port=8000)
