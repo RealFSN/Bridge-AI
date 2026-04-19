@@ -30,7 +30,7 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-    http: ^1.2.0           # 👈 هذه هي المكتبة المفقودة للربط مع app.py
+  http: ^1.2.0           # 👈 هذه هي المكتبة المفقودة للربط مع app.py
   cupertino_icons: ^1.0.8
   camera: ^0.11.0+2
   audioplayers: ^6.4.0
