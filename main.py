@@ -8,9 +8,8 @@ import gradio as gr
 
 # --- 1. إعداد المفاتيح ---
 # استبدل النجوم بمفاتيحك الحقيقية
-os.environ["OPENAI_API_KEY"] = "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" 
-os.environ["GOOGLE_API_KEY"] = "AIzaSyCEha0n0YrS-1nFwOLRptOqW0_ixBkRJqw"
-
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") 
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # تهيئة العملاء
 oa_client = OpenAI()
 genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
