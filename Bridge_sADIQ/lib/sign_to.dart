@@ -1,17 +1,17 @@
 import 'dart:async';
-import 'package:bridge1/donwloded.dart'; 
+import 'dart:typed_data'; // Added for Uint8List
+import 'package:bridge1/donwloded.dart';
 import 'package:bridge1/home.dart';
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:language_picker/language_picker.dart';
 import 'package:language_picker/languages.dart';
 import 'package:image_picker/image_picker.dart';
-import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:just_audio/just_audio.dart';
 
 import 'processing_screen.dart';
+import 'api_service.dart'; // Import the new service
 
-// 1. المتغير العالمي (Global) لضمان وصول الـ main إليه
 List<CameraDescription> cameras = [];
 
 class SignToTextPage extends StatefulWidget {
@@ -29,7 +29,6 @@ class _SignToTextPageState extends State<SignToTextPage> {
 
   String _liveTranslationText = "";
   bool _isRecording = false;
-  WebSocketChannel? _wsChannel;
   Timer? _frameTimer;
 
   final AudioPlayer _audioPlayer = AudioPlayer();
@@ -40,22 +39,47 @@ class _SignToTextPageState extends State<SignToTextPage> {
   static const Color secondaryBg = Color(0xFFF8F9FA);
   static const Color placeholderBg = Color(0xFF1A1F2E);
 
+  Map<String, String> _signLanguages = {};
+  String? _selectedSignLanguageId;
+  bool _isLoadingSignLanguages = true;
+
+  // --- API Service Instance ---
+  final ApiService _apiService = ApiService();
+  bool _isSendingFrame = false; // Safety lock for high-res frames
+
   @override
   void initState() {
     super.initState();
-    // نقوم بمحاولة تشغيل الكاميرا تلقائياً عند الدخول للصفحة إذا كانت القائمة جاهزة
+    loadLanguages();
     if (cameras.isNotEmpty) {
       startCamera();
     }
   }
 
-  // --- وظائف الكاميرا المعدلة ---
+  Future<void> loadLanguages() async {
+    final fetchedLanguages = await _apiService.fetchSignLanguages();
+
+    if (fetchedLanguages == null) {
+      debugPrint(
+          "Error: Couldn't load sign languages. fetched langauges are null");
+    }
+
+    if (mounted) {
+      setState(() {
+        _signLanguages = fetchedLanguages ?? {};
+        if (_signLanguages.isNotEmpty) {
+          _selectedSignLanguageId = _signLanguages.keys.first;
+        }
+        _isLoadingSignLanguages = false;
+      });
+    }
+  }
 
   Future<void> startCamera() async {
-    // التأكد من جلب الكاميرات إذا كانت القائمة فارغة لأي سبب
     if (cameras.isEmpty) {
       try {
         cameras = await availableCameras();
+        print(cameras.length);
       } catch (e) {
         debugPrint("Error fetching cameras: $e");
       }
@@ -74,7 +98,7 @@ class _SignToTextPageState extends State<SignToTextPage> {
       cameras[selectedCamera],
       ResolutionPreset.medium,
       enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.jpeg, // مهم لبعض أجهزة الأندرويد
+      imageFormatGroup: ImageFormatGroup.jpeg,
     );
 
     try {
@@ -95,19 +119,20 @@ class _SignToTextPageState extends State<SignToTextPage> {
   Future<void> switchCamera() async {
     if (cameras.length < 2) return;
     selectedCamera = selectedCamera == 0 ? 1 : 0;
-    
-    // إغلاق الكاميرا الحالية قبل تشغيل الجديدة
+
     await controller?.dispose();
     controller = null;
     setState(() {});
-    
+
     await startCamera();
   }
 
-  // --- منطق الـ Streaming (WebSocket) ---
+  // --- Streaming Logic using ApiService ---
 
   Future<void> _startRecordingAndStreaming() async {
-    if (controller == null || !controller!.value.isInitialized) return;
+    if (controller == null ||
+        !controller!.value.isInitialized ||
+        _selectedSignLanguageId == null) return;
 
     setState(() {
       _liveTranslationText = "";
@@ -115,79 +140,64 @@ class _SignToTextPageState extends State<SignToTextPage> {
       _lastAudioUrl = null;
     });
 
-    try {
-      _wsChannel = WebSocketChannel.connect(
-        Uri.parse(
-          'ws://YOUR_BACKEND_URL/ws/sign-translation?lang=${_selectedLanguage.isoCode}',
-        ),
-      );
-
-      _wsChannel!.stream.listen(
-        (message) {
-          if (message is String) {
-            try {
-              final data = _parseMessage(message);
-              setState(() {
-                if (data['text'] != null && data['text']!.isNotEmpty) {
-                  _liveTranslationText += "${data['text']} ";
-                }
-                if (data['audio_url'] != null && data['audio_url']!.isNotEmpty) {
-                  _lastAudioUrl = data['audio_url'];
-                }
-              });
-            } catch (_) {
-              setState(() {
-                _liveTranslationText += "$message ";
-              });
+    _apiService.startTranslationStream(
+      languageId: _selectedSignLanguageId!,
+      onResult: (data) {
+        if (mounted) {
+          setState(() {
+            if (data['text'] != null && data['text'].toString().isNotEmpty) {
+              _liveTranslationText += "${data['text']} ";
             }
-          }
-        },
-        onError: (error) => debugPrint("WebSocket Error: $error"),
-        onDone: () => debugPrint("WebSocket closed"),
-      );
+            if (data['audio_url'] != null &&
+                data['audio_url'].toString().isNotEmpty) {
+              _lastAudioUrl = data['audio_url'];
+            }
+          });
+        }
+      },
+      onDone: () {
+        debugPrint("WebSocket closed");
+        if (mounted && _isRecording) _stopRecording();
+      },
+      onError: (error) {
+        debugPrint("Streaming error: $error");
+        if (mounted && _isRecording) _stopRecording();
+      },
+    );
 
-      _frameTimer = Timer.periodic(
-        const Duration(milliseconds: 500),
-        (_) async => await _captureAndSendFrame(),
-      );
-    } catch (e) {
-      debugPrint("Streaming error: $e");
-      setState(() => _isRecording = false);
-    }
-  }
-
-  Map<String, String?> _parseMessage(String message) {
-    if (message.startsWith('{')) {
-      final textMatch = RegExp(r'"text"\s*:\s*"([^"]*)"').firstMatch(message);
-      final audioMatch = RegExp(r'"audio_url"\s*:\s*"([^"]*)"').firstMatch(message);
-      return {
-        'text': textMatch?.group(1),
-        'audio_url': audioMatch?.group(1),
-      };
-    }
-    return {'text': message, 'audio_url': null};
+    _frameTimer = Timer.periodic(
+      const Duration(milliseconds: 500),
+      (_) async => await _captureAndSendFrame(),
+    );
   }
 
   Future<void> _captureAndSendFrame() async {
-    if (controller == null || !controller!.value.isInitialized || _wsChannel == null) return;
+    // Implement safety lock to prevent buffer bloat
+    if (controller == null ||
+        !controller!.value.isInitialized ||
+        _isSendingFrame) return;
+
     try {
+      _isSendingFrame = true;
       final XFile imageFile = await controller!.takePicture();
-      final bytes = await imageFile.readAsBytes();
-      _wsChannel!.sink.add(bytes);
+      final Uint8List bytes = await imageFile.readAsBytes();
+
+      _apiService.sendFrame(bytes);
     } catch (e) {
       debugPrint("Frame capture error: $e");
+    } finally {
+      _isSendingFrame = false;
     }
   }
 
   void _stopRecording() {
     _frameTimer?.cancel();
     _frameTimer = null;
-    _wsChannel?.sink.close();
-    _wsChannel = null;
-    setState(() => _isRecording = false);
+    _apiService.stopTranslationStream();
+    if (mounted) setState(() => _isRecording = false);
   }
 
-  // --- منطق الرفع والانتقال ---
+  // --- Other Methods ---
 
   Future<void> _pickVideoFromGallery() async {
     try {
@@ -223,16 +233,17 @@ class _SignToTextPageState extends State<SignToTextPage> {
                 builder: (context) => ProcessingPage(
                   title: "Processing Video",
                   subtitle: "Translating to ${language.name}...",
-                  requestFuture: _uploadVideoToBackend(videoPath, language.isoCode),
+                  requestFuture:
+                      _uploadVideoToBackend(videoPath, language.isoCode),
                   onSuccess: (result) {
-  // هنا نخبر صفحة البروسيسنج أن تذهب للنتيجة النصية عند النجاح
-  Navigator.pushReplacement(
-    context,
-    MaterialPageRoute(
-      builder: (context) => TranslationResultPage(resultText: result.toString()),
-    ),
-  );
-},
+                    Navigator.pushReplacement(
+                      context,
+                      MaterialPageRoute(
+                        builder: (context) => TranslationResultPage(
+                            resultText: result.toString()),
+                      ),
+                    );
+                  },
                 ),
               ),
             );
@@ -278,9 +289,9 @@ class _SignToTextPageState extends State<SignToTextPage> {
 
   void _onLanguageChanged(Language language) {
     setState(() => _selectedLanguage = language);
-    if (_wsChannel != null && _isRecording) {
-      _wsChannel!.sink.add('{"action": "change_lang", "lang": "${language.isoCode}"}');
-    }
+    // Note: If you need to tell the backend about the target language change
+    // while streaming, you might need a new method in ApiService or to
+    // restart the stream.
   }
 
   void _openLanguagePickerDialog() {
@@ -308,15 +319,72 @@ class _SignToTextPageState extends State<SignToTextPage> {
   @override
   void dispose() {
     _frameTimer?.cancel();
-    _wsChannel?.sink.close();
+    _apiService.stopTranslationStream();
     controller?.dispose();
     _audioPlayer.dispose();
     super.dispose();
   }
 
+  Widget _buildSignLanguageDropdown() {
+    if (_isLoadingSignLanguages) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(horizontal: 10),
+        child: SizedBox(
+          width: 20,
+          height: 20,
+          child: CircularProgressIndicator(strokeWidth: 2, color: primaryColor),
+        ),
+      );
+    }
+
+    if (_signLanguages.isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(horizontal: 10),
+        child: Icon(Icons.error_outline, color: Colors.red),
+      );
+    }
+
+    return SizedBox(
+      height: 40,
+      child: Container(
+        margin: const EdgeInsets.only(right: 8),
+        padding: const EdgeInsets.symmetric(horizontal: 10),
+        decoration: BoxDecoration(
+          color: primaryColor.withOpacity(0.1),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: DropdownButtonHideUnderline(
+          child: DropdownButton<String>(
+            value: _selectedSignLanguageId,
+            focusColor: Colors.transparent,
+            dropdownColor: Colors.white,
+            style: const TextStyle(
+                color: primaryColor, fontWeight: FontWeight.bold, fontSize: 14),
+            icon: const Icon(Icons.arrow_drop_down, color: primaryColor),
+            isDense: true,
+            onChanged: (String? newValue) {
+              setState(() {
+                _selectedSignLanguageId = newValue;
+              });
+              FocusManager.instance.primaryFocus?.unfocus();
+            },
+            items:
+                _signLanguages.entries.map<DropdownMenuItem<String>>((entry) {
+              return DropdownMenuItem<String>(
+                value: entry.key,
+                child: Text(entry.value),
+              );
+            }).toList(),
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    bool isCameraRunning = controller != null && controller!.value.isInitialized;
+    bool isCameraRunning =
+        controller != null && controller!.value.isInitialized;
 
     return Scaffold(
       backgroundColor: Colors.white,
@@ -364,8 +432,10 @@ class _SignToTextPageState extends State<SignToTextPage> {
                           child: Column(
                             mainAxisAlignment: MainAxisAlignment.center,
                             children: [
-                              Icon(Icons.videocam_outlined, color: Colors.white54, size: 50),
-                              Text("Camera is Off", style: TextStyle(color: Colors.white54)),
+                              Icon(Icons.videocam_outlined,
+                                  color: Colors.white54, size: 50),
+                              Text("Camera is Off",
+                                  style: TextStyle(color: Colors.white54)),
                             ],
                           ),
                         ),
@@ -374,7 +444,8 @@ class _SignToTextPageState extends State<SignToTextPage> {
                       top: 12,
                       right: 12,
                       child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 10, vertical: 5),
                         decoration: BoxDecoration(
                           color: Colors.red,
                           borderRadius: BorderRadius.circular(20),
@@ -384,7 +455,11 @@ class _SignToTextPageState extends State<SignToTextPage> {
                           children: [
                             Icon(Icons.circle, color: Colors.white, size: 10),
                             SizedBox(width: 5),
-                            Text("LIVE", style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)),
+                            Text("LIVE",
+                                style: TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.bold)),
                           ],
                         ),
                       ),
@@ -399,12 +474,15 @@ class _SignToTextPageState extends State<SignToTextPage> {
                 Expanded(
                   child: OutlinedButton.icon(
                     onPressed: _isRecording ? null : _pickVideoFromGallery,
-                    icon: const Icon(Icons.upload_outlined, color: primaryColor),
-                    label: const Text("Upload", style: TextStyle(color: primaryColor)),
+                    icon:
+                        const Icon(Icons.upload_outlined, color: primaryColor),
+                    label: const Text("Upload",
+                        style: TextStyle(color: primaryColor)),
                     style: OutlinedButton.styleFrom(
                       padding: const EdgeInsets.symmetric(vertical: 12),
                       side: const BorderSide(color: primaryColor, width: 1.5),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(15)),
                     ),
                   ),
                 ),
@@ -438,20 +516,25 @@ class _SignToTextPageState extends State<SignToTextPage> {
                               : Colors.orange,
                       foregroundColor: Colors.white,
                       padding: const EdgeInsets.symmetric(vertical: 12),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(15)),
                     ),
                   ),
                 ),
                 const SizedBox(width: 10),
                 Expanded(
                   child: OutlinedButton.icon(
-                    onPressed: (isCameraRunning && !_isRecording) ? switchCamera : null,
+                    onPressed: (isCameraRunning && !_isRecording)
+                        ? switchCamera
+                        : null,
                     icon: const Icon(Icons.cameraswitch, color: primaryColor),
-                    label: const Text("Switch", style: TextStyle(color: primaryColor)),
+                    label: const Text("Switch",
+                        style: TextStyle(color: primaryColor)),
                     style: OutlinedButton.styleFrom(
                       padding: const EdgeInsets.symmetric(vertical: 12),
                       side: const BorderSide(color: primaryColor, width: 1.5),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(15)),
                     ),
                   ),
                 ),
@@ -462,28 +545,40 @@ class _SignToTextPageState extends State<SignToTextPage> {
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                const Text("Translation", style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                const Text("Translation",
+                    style:
+                        TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
                 Row(
                   children: [
                     Container(
                       margin: const EdgeInsets.only(right: 8),
                       decoration: BoxDecoration(
-                        color: _isPlayingAudio ? primaryColor : primaryColor.withOpacity(0.1),
+                        color: _isPlayingAudio
+                            ? primaryColor
+                            : primaryColor.withOpacity(0.1),
                         borderRadius: BorderRadius.circular(12),
                       ),
                       child: IconButton(
                         onPressed: _lastAudioUrl != null ? _toggleAudio : null,
                         icon: Icon(
-                          _isPlayingAudio ? Icons.stop_circle_outlined : Icons.volume_up_rounded,
-                          color: _lastAudioUrl != null ? (_isPlayingAudio ? Colors.white : primaryColor) : Colors.grey,
+                          _isPlayingAudio
+                              ? Icons.stop_circle_outlined
+                              : Icons.volume_up_rounded,
+                          color: _lastAudioUrl != null
+                              ? (_isPlayingAudio ? Colors.white : primaryColor)
+                              : Colors.grey,
                           size: 26,
                         ),
                       ),
                     ),
+                    _buildSignLanguageDropdown(),
                     TextButton.icon(
                       onPressed: _openLanguagePickerDialog,
                       icon: const Icon(Icons.language, color: primaryColor),
-                      label: Text(_selectedLanguage.isoCode.toUpperCase(), style: const TextStyle(color: primaryColor, fontWeight: FontWeight.bold)),
+                      label: Text(_selectedLanguage.isoCode.toUpperCase(),
+                          style: const TextStyle(
+                              color: primaryColor,
+                              fontWeight: FontWeight.bold)),
                     ),
                   ],
                 ),
@@ -502,14 +597,19 @@ class _SignToTextPageState extends State<SignToTextPage> {
                 child: _liveTranslationText.isEmpty
                     ? Center(
                         child: Text(
-                          _isRecording ? "🎙️ Listening..." : "Translation will appear here",
-                          style: TextStyle(color: _isRecording ? primaryColor : Colors.grey, fontSize: 16),
+                          _isRecording
+                              ? "🎙️ Listening..."
+                              : "Translation will appear here",
+                          style: TextStyle(
+                              color: _isRecording ? primaryColor : Colors.grey,
+                              fontSize: 16),
                         ),
                       )
                     : SingleChildScrollView(
                         child: Text(
                           _liveTranslationText,
-                          style: const TextStyle(color: Colors.black87, fontSize: 18, height: 1.6),
+                          style: const TextStyle(
+                              color: Colors.black87, fontSize: 18, height: 1.6),
                         ),
                       ),
               ),

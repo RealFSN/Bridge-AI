@@ -1,0 +1,28 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Bridge_sADIQ",
+            "cwd": "Bridge_sADIQ",
+            "request": "launch",
+            "type": "dart"
+        },
+        {
+            "name": "Bridge_sADIQ (profile mode)",
+            "cwd": "Bridge_sADIQ",
+            "request": "launch",
+            "type": "dart",
+            "flutterMode": "profile"
+        },
+        {
+            "name": "Bridge_sADIQ (release mode)",
+            "cwd": "Bridge_sADIQ",
+            "request": "launch",
+            "type": "dart",
+            "flutterMode": "release"
+        }
+    ]
+}
