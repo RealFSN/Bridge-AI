@@ -77,7 +77,7 @@ class ApiService {
     }
   }
 
-  void sendFrame(Uint8List frameBytes) {
+  void sendFrame(Uint8List frameBytes) async {
     if (_wsChannel != null) {
       _wsChannel!.sink.add(frameBytes);
     }

@@ -5,10 +5,11 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Bridge_sADIQ",
+            "name": "Bridge_sADIQ_mobile",
             "cwd": "Bridge_sADIQ",
             "request": "launch",
-            "type": "dart"
+            "type": "dart",
+            "deviceId": "R5CY53P1SJV"
         },
         {
             "name": "Bridge_sADIQ (profile mode)",

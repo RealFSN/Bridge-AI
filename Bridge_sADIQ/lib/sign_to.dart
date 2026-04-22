@@ -8,11 +8,79 @@ import 'package:language_picker/language_picker.dart';
 import 'package:language_picker/languages.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:image/image.dart' as imglib;
+import 'package:flutter/foundation.dart';
 
 import 'processing_screen.dart';
 import 'api_service.dart'; // Import the new service
 
 List<CameraDescription> cameras = [];
+
+imglib.Image convertYUV420ToImage(CameraImage cameraImage) {
+  final imageWidth = cameraImage.width;
+  final imageHeight = cameraImage.height;
+
+  final yBuffer = cameraImage.planes[0].bytes;
+  final uBuffer = cameraImage.planes[1].bytes;
+  final vBuffer = cameraImage.planes[2].bytes;
+
+  final int yRowStride = cameraImage.planes[0].bytesPerRow;
+  final int yPixelStride = cameraImage.planes[0].bytesPerPixel!;
+
+  final int uvRowStride = cameraImage.planes[1].bytesPerRow;
+  final int uvPixelStride = cameraImage.planes[1].bytesPerPixel!;
+
+  final image = imglib.Image(width: imageWidth, height: imageHeight);
+
+  for (int h = 0; h < imageHeight; h++) {
+    int uvh = (h / 2).floor();
+
+    for (int w = 0; w < imageWidth; w++) {
+      int uvw = (w / 2).floor();
+
+      final yIndex = (h * yRowStride) + (w * yPixelStride);
+
+      // Y plane should have positive values belonging to [0...255]
+      final int y = yBuffer[yIndex];
+
+      // U/V Values are subsampled i.e. each pixel in U/V chanel in a
+      // YUV_420 image act as chroma value for 4 neighbouring pixels
+      final int uvIndex = (uvh * uvRowStride) + (uvw * uvPixelStride);
+
+      // U/V values ideally fall under [-0.5, 0.5] range. To fit them into
+      // [0, 255] range they are scaled up and centered to 128.
+      // Operation below brings U/V values to [-128, 127].
+      final int u = uBuffer[uvIndex];
+      final int v = vBuffer[uvIndex];
+
+      // Compute RGB values per formula above.
+      int r = (y + v * 1436 / 1024 - 179).round();
+      int g = (y - u * 46549 / 131072 + 44 - v * 93604 / 131072 + 91).round();
+      int b = (y + u * 1814 / 1024 - 227).round();
+
+      r = r.clamp(0, 255);
+      g = g.clamp(0, 255);
+      b = b.clamp(0, 255);
+
+      image.setPixelRgb(w, h, r, g, b);
+    }
+  }
+
+  return image;
+}
+
+Future<Uint8List> _processCameraImageInIsolate(CameraImage image) async {
+  // 1. Do the heavy math to convert YUV to RGB
+  imglib.Image img = convertYUV420ToImage(image);
+
+  img = imglib.copyRotate(img, angle: 90);
+
+  // 2. Encode it as a JPEG so OpenCV can read it!
+  // Quality 70 is a good balance of speed and YOLOv8 accuracy
+  final List<int> jpegData = imglib.encodeJpg(img, quality: 70);
+
+  return Uint8List.fromList(jpegData);
+}
 
 class SignToTextPage extends StatefulWidget {
   const SignToTextPage({super.key});
@@ -46,6 +114,12 @@ class _SignToTextPageState extends State<SignToTextPage> {
   // --- API Service Instance ---
   final ApiService _apiService = ApiService();
   bool _isSendingFrame = false; // Safety lock for high-res frames
+
+  String _currentLetter = "WIP";
+
+  final int _confirmLetterFrameNumber = 5;
+  int _frameCounter = 0;
+  final int _spaceConfirmFramesNumber = 10;
 
   @override
   void initState() {
@@ -98,7 +172,7 @@ class _SignToTextPageState extends State<SignToTextPage> {
       cameras[selectedCamera],
       ResolutionPreset.medium,
       enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.jpeg,
+      imageFormatGroup: ImageFormatGroup.yuv420,
     );
 
     try {
@@ -145,12 +219,20 @@ class _SignToTextPageState extends State<SignToTextPage> {
       onResult: (data) {
         if (mounted) {
           setState(() {
-            if (data['text'] != null && data['text'].toString().isNotEmpty) {
-              _liveTranslationText += "${data['text']} ";
-            }
-            if (data['audio_url'] != null &&
-                data['audio_url'].toString().isNotEmpty) {
-              _lastAudioUrl = data['audio_url'];
+            if (_currentLetter != data["label"]) {
+              _currentLetter = data["label"];
+              _frameCounter = 1;
+            } else {
+              _frameCounter++;
+              if (_currentLetter == "Nothing" && _frameCounter == _spaceConfirmFramesNumber) {
+                if (_liveTranslationText[_liveTranslationText.length - 1] != "_") {
+                  _liveTranslationText += "_";
+                }
+                _frameCounter = 0;
+              } else if (_currentLetter != "Nothing" && _frameCounter == _confirmLetterFrameNumber) {
+                _liveTranslationText += _currentLetter;
+                _frameCounter = 0;
+              }
             }
           });
         }
@@ -164,11 +246,21 @@ class _SignToTextPageState extends State<SignToTextPage> {
         if (mounted && _isRecording) _stopRecording();
       },
     );
-
-    _frameTimer = Timer.periodic(
-      const Duration(milliseconds: 500),
-      (_) async => await _captureAndSendFrame(),
-    );
+    
+    await controller!.startImageStream((CameraImage image) async {
+      if (_isSendingFrame) return;
+      _isSendingFrame = true;
+      
+      try {
+        final Uint8List imgData = await compute(_processCameraImageInIsolate, image);
+        
+        _apiService.sendFrame(imgData);
+      } catch (e) {
+        debugPrint("Stream processing error: $e");
+      } finally {
+        _isSendingFrame = false;
+      }
+    });
   }
 
   Future<void> _captureAndSendFrame() async {
@@ -191,14 +283,19 @@ class _SignToTextPageState extends State<SignToTextPage> {
   }
 
   void _stopRecording() {
+    if (mounted) {
+      setState(() {
+        _isRecording = false;
+        _liveTranslationText = _liveTranslationText.replaceAll(RegExp(r"_"), " ");
+      });
+    }
     _frameTimer?.cancel();
     _frameTimer = null;
     _apiService.stopTranslationStream();
-    if (mounted) setState(() => _isRecording = false);
+    controller!.stopImageStream();
   }
 
   // --- Other Methods ---
-
   Future<void> _pickVideoFromGallery() async {
     try {
       final XFile? video = await _picker.pickVideo(source: ImageSource.gallery);
@@ -440,29 +537,59 @@ class _SignToTextPageState extends State<SignToTextPage> {
                           ),
                         ),
                   if (_isRecording)
-                    Positioned(
-                      top: 12,
-                      right: 12,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 10, vertical: 5),
-                        decoration: BoxDecoration(
-                          color: Colors.red,
-                          borderRadius: BorderRadius.circular(20),
+                    Stack(
+                      children: [
+                        Positioned(
+                          top: 12,
+                          right: 12,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 10, vertical: 5),
+                            decoration: BoxDecoration(
+                              color: Colors.red,
+                              borderRadius: BorderRadius.circular(20),
+                            ),
+                            child: const Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(Icons.circle,
+                                    color: Colors.white, size: 10),
+                                SizedBox(width: 5),
+                                Text("LIVE",
+                                    style: TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.bold)),
+                              ],
+                            ),
+                          ),
                         ),
-                        child: const Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(Icons.circle, color: Colors.white, size: 10),
-                            SizedBox(width: 5),
-                            Text("LIVE",
-                                style: TextStyle(
-                                    color: Colors.white,
-                                    fontSize: 12,
-                                    fontWeight: FontWeight.bold)),
-                          ],
+                        Positioned(
+                          top: 12,
+                          left: 12,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 10, vertical: 5),
+                            decoration: BoxDecoration(
+                              color: Colors.red,
+                              borderRadius: BorderRadius.circular(20),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const Icon(Icons.sign_language,
+                                    color: Colors.white, size: 10),
+                                const SizedBox(width: 5),
+                                Text("Prediction: $_currentLetter",
+                                    style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.bold)),
+                              ],
+                            ),
+                          ),
                         ),
-                      ),
+                      ],
                     ),
                 ],
               ),
